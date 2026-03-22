@@ -28,4 +28,11 @@ I'm not going into too much details on hardware aspects, but this is wat I'm usi
 - CeByte E75
 - Breadboard (note that E75 uses a 1.27mm pitch!!)
 
+## Functions
+Well, as said, the ESP32 functions as a bridge between JN516x and Meta-brain. As such, it doesn;t really deliver functionality itself.
+But, it has a GUI that shows you whats being passed from Brain to JN516x vice versa. It also allows you to trigger certain parts of thr JN516x-functionality manually.
 
+## Future
+Right now, I'm satisfied with the ESP32 part (the border router functionality), next step is to hook up an actual JN516x to it (via UART). The JN516x will be flashed with 6LowPan-firmware that will do the same as in the physical NEEO-brain. Once the devices communicate and the JN516x is functioning too, we will be able to detect a NEEO-remote (TR2) once it is in the vicinity of the JN516x. That opens the road to have the TR2 associate (pair) itself with the Docker Meta Brain, which enables pushing updates to the TR2 in case of restarts of the Meta Brain.
+Once that's working, I'll extend the prototype board to include normal LED's (red and White), followed by Infrared-LEDs. These need to be driven by transistors as the JN516x isn;t able to source much current.
+That will be the final goal for this project: having a fully integrated Docker Meta Brain connected wirelessly which is aware of 6LowPan devices as the NEEO TR2 and able to send (and learn) Infrared signals. With that achieved, you will be able to place this device somewhere in your room and have it function as a gateway to your Doc ker Meta Brain; it can be powered by a regular USB-adapter.  
