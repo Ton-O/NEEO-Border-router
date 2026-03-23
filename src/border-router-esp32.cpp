@@ -1,13 +1,15 @@
 #include <Arduino.h>
+#include "wifi_provisioning.h"
 #include <WiFi.h>
 #include <AsyncTCP.h>
+#include <WiFiManager.h> 
+
 #include <ESPAsyncWebServer.h>
 #include <HTTPClient.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <IPAddress.h>
 #include "time.h"
-#include "wifi_provisioning.h"
 
 /* --- Hardware Configuration --- */
 #define RX2_PIN      16
@@ -25,6 +27,9 @@ char logBuffer[MAX_LOG_LINES][MAX_LINE_LEN];
 int logIndex = 0;
 bool bufferFull = false;
 
+/**
+ * Adds a message to the internal ring buffer with a timestamp.
+ */
 void addToLog(const char* msg) {
   struct tm timeinfo;
   char tStr[12];
@@ -37,6 +42,9 @@ void addToLog(const char* msg) {
   Serial.println(msg); 
 }
 
+/**
+ * Returns the full log as a single String for the web interface.
+ */
 String getFullLog() {
   String output = "";
   output.reserve(4000); 
@@ -58,7 +66,21 @@ String brainName;
 String timezonePosix;
 bool debugEnabled = true;
 
+/**
+ * Disables unused GPIO pins to prevent noise/interference.
+ */
+void disableUnusedPins() {
+    int unusedPins[] = {13, 14, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33};
+    for (int i = 0; i < sizeof(unusedPins) / sizeof(unusedPins[0]); i++) {
+        pinMode(unusedPins[i], INPUT_PULLUP);
+    }
+}
+
 /* --- Helpers --- */
+
+/**
+ * Sends a GET request to the NEEO Brain.
+ */
 void sendBrainRequest(String path) {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
@@ -72,8 +94,11 @@ void sendBrainRequest(String path) {
   }
 }
 
+/**
+ * Performs a diagnostic sequence to check pin communication.
+ */
 void performPinDiagnostic() {
-  addToLog("Diagnostic: Start Pin-Check sequence");
+  addToLog("Diagnostic: Starting Pin-Check sequence");
   Serial2.write(0x11); delay(500); 
   Serial2.write(0x21); delay(500); 
   uint8_t dummyIR[] = {'!', 'I', 0x94, 0x70, 0x01, 0x00, 0x05, 'E'};
@@ -124,11 +149,27 @@ void handleIRRequest(AsyncWebServerRequest *request) {
   request->send(200, "text/plain", "OK");
 }
 
+/**
+ * Checks and logs the WiFi signal strength (RSSI).
+ */
+void checkWiFiSignal() {
+  if (WiFi.status() == WL_CONNECTED) {
+    long rssi = WiFi.RSSI();
+    String quality = (rssi > -50) ? "Excellent" : (rssi > -70) ? "Good" : (rssi > -80) ? "Fair" : "Poor";
+    if (rssi > -80) {
+      String logMsg = "WiFi Signal: " + String(rssi) + " dBm (" + quality + ")";
+      addToLog(logMsg.c_str()); 
+    }
+  }
+}
+
 /* --- Setup --- */
 void setup() {
   Serial.begin(115200); 
   Serial2.begin(E75_BAUD, SERIAL_8N1, RX2_PIN, TX2_PIN);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  disableUnusedPins();
 
   preferences.begin("neeo", false);
   brainName = preferences.getString("brain_name", "neeo");
@@ -136,7 +177,13 @@ void setup() {
   debugEnabled = preferences.getBool("debug_logs", true); 
   preferences.end();
 
+  WiFi.persistent(true); 
+  WiFi.setSleep(false);  
+
   connectWiFi(); 
+  
+  Serial.print("WiFi Connected. IP: ");
+  Serial.println(WiFi.localIP());
   
   configTime(0, 0, ntpServer);     
   setenv("TZ", timezonePosix.c_str(), 1);        
@@ -147,6 +194,7 @@ void setup() {
       MDNS.addService("neeo-bridge", "tcp", 60001);
   }
 
+  // Web Interface Handler
   server.on("/", HTTP_ANY, [](AsyncWebServerRequest *request){
     String html = "<html><head><title>NEEO Border Router</title>";
     html += "<style>body{font-family:sans-serif;margin:20px;background:#f0f2f5;}";
@@ -169,24 +217,35 @@ void setup() {
     html += "<button onclick=\"fetch('/ShortPress')\">ShortPress</button>";
     html += "<button onclick=\"fetch('/LongPress')\">LongPress</button></div></div>";
 
-    html += "<div class='card'><h3>Configuratie</h3><form action='/save' method='POST'>";
-    html += "Brain Naam:<br><input type='text' name='brain' value='" + brainName + "'><br><br>";
-    html += "Locatie:<br><select id='tzSelect' onchange='document.getElementById(\"tzPosix\").value=this.value'><option>Lijst laden...</option></select><br><br>";
+    html += "<div class='card'><h3>Configuration</h3><form action='/save' method='POST'>";
+    html += "Brain Name:<br><input type='text' name='brain' value='" + brainName + "'><br><br>";
+    html += "Location:<br><select id='tzSelect' onchange='document.getElementById(\"tzPosix\").value=this.value'><option>Loading list...</option></select><br><br>";
     html += "POSIX String:<br><input type='text' name='tz_posix' id='tzPosix' value='" + timezonePosix + "'><br><br>";
     html += "Debug Logs: <input type='checkbox' name='debug' " + String(debugEnabled ? "checked" : "") + "><br><br>";
-    html += "<input type='submit' value='Opslaan & Herstarten'></form></div>";
+    html += "<input type='submit' value='Save & Restart'></form></div>";
 
     html += "<div class='card'><h3>Log</h3><pre id='log'>" + getFullLog() + "</pre>";
-    html += "<button onclick=\"fetch('/clearlog').then(()=>location.reload())\">Log Wissen</button></div>";
+    html += "<button onclick=\"fetch('/clearlog').then(()=>location.reload())\">Clear Log</button></div>";
+ 
+    html += "<div class='card'><h3>Network Settings</h3>";
+    html += "<p>Current SSID: <b>" + WiFi.SSID() + "</b></p>";
+    html += "<button class='red' onclick='confirmWifiReset()'>Change WiFi Network</button></div>";
 
     html += "<script>";
+    html += "function confirmWifiReset() {";
+    html += "  if(confirm('Wilt u de WiFi-instellingen wissen en een nieuwe verbinding instellen? De device herstart naar de setup portal.')) {";
+    html += "    fetch('/reset_wifi', {method: 'POST'}).then(() => {";
+    html += "      alert('Instellingen gewist. Zoek naar de NEEO-Border-Router hotspot op je telefoon.');";
+    html += "    });";
+    html += "  }";
+    html += "}";
     html += "async function loadTZ() {";
     html += "  try {";
     html += "    const res = await fetch('https://raw.githubusercontent.com/nayarsystems/posix_tz_db/master/zones.csv');";
     html += "    const text = await res.text();";
     html += "    const lines = text.split('\\n');";
     html += "    const select = document.getElementById('tzSelect');";
-    html += "    select.innerHTML = '<option value=\"\">Selecteer een locatie...</option>';";
+    html += "    select.innerHTML = '<option value=\"\">Select a location...</option>';";
     html += "    lines.forEach(line => {";
     html += "      const parts = line.split('\",\"');";
     html += "      if(parts.length >= 2) {";
@@ -207,6 +266,7 @@ void setup() {
     request->send(200, "text/html", html);
   });
 
+  // Save Settings Handler
   server.on("/save", HTTP_POST, [](AsyncWebServerRequest *request){
     preferences.begin("neeo", false);
     if (request->hasParam("brain", true)) preferences.putString("brain_name", request->getParam("brain", true)->value());
@@ -214,11 +274,12 @@ void setup() {
     preferences.putBool("debug_logs", request->hasParam("debug", true));
     preferences.end();
     
-    addToLog("SYS: Instellingen opgeslagen, herstarten...");
+    addToLog("SYS: Settings saved, restarting...");
     request->send(200, "text/plain", "OK");
     delay(500); ESP.restart();
   });
 
+  // Blink LED Handler
   server.on("/blink", HTTP_ANY, [](AsyncWebServerRequest *request){
     String mode = request->hasParam("mode", true) ? request->getParam("mode", true)->value() : "off";
     uint8_t cmd = (mode == "red") ? 0x11 : (mode == "white") ? 0x21 : 0x00;
@@ -229,6 +290,7 @@ void setup() {
     request->send(200, "text/plain", "OK");
   });
 
+  // Neighbor Fetch Handler
   server.on("/neighbors", HTTP_ANY, [](AsyncWebServerRequest *request){
     addToLog("WEB: Fetching neighbors...");
     Serial2.write(0x05); 
@@ -237,13 +299,14 @@ void setup() {
     request->send(200, "text/plain", response);
   });
 
+  // Security Key Handler
   auto handleSecurity = [](AsyncWebServerRequest *request) {
     bool isDisc = (request->url() == "/discovery");
     char cmd = isDisc ? 'K' : 'E';
     if (request->hasParam("airkey", true)) {
       String ak = request->getParam("airkey", true)->value();
       Serial2.write('!'); Serial2.write(cmd); Serial2.print(ak); Serial2.write('\n');
-      addToLog(("SECURITY: Update " + String(isDisc?"Disc":"Enc") + " key").c_str());
+      addToLog(("SECURITY: Updating " + String(isDisc?"Discovery":"Encryption") + " key").c_str());
       request->send(200, "text/plain", "OK");
     } else { request->send(400, "text/plain", "Missing key"); }
   };
@@ -277,10 +340,22 @@ void setup() {
     bufferFull=false; logIndex=0; request->send(200, "text/plain", "Cleared"); 
   });
 
+  // WiFi SSID Change Handler
+  server.on("/reset_wifi", HTTP_POST, [](AsyncWebServerRequest *request){
+    addToLog("SYS: WiFi Reset triggered. Erasing settings and entering Config Portal...");
+    request->send(200, "text/plain", "OK");
+    delay(1000);
+    WiFiManager wm;
+    wm.resetSettings(); // Wist de NVS-geheugen van WiFiManager
+    WiFi.disconnect(true, true); 
+    ESP.restart();
+  });
+
   server.begin();
   tcpBridge.begin();
   tcpBridge.setNoDelay(true);
   addToLog("Services Online");
+  delay(500); 
 }
 
 void loop() {
@@ -315,5 +390,11 @@ void loop() {
     size_t len = Serial2.readBytes(buf, min((int)Serial2.available(), 256));
     if (bridgeClient && bridgeClient.connected()) bridgeClient.write(buf, len);
     else if(debugEnabled) Serial.write(buf, len);
+  }
+
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 30000) { 
+    checkWiFiSignal();
+    lastCheck = millis();
   }
 }
