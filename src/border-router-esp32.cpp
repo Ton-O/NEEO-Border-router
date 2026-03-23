@@ -64,6 +64,7 @@ Preferences preferences;
 
 String brainName;
 String timezonePosix;
+String timezoneName; 
 bool debugEnabled = true;
 
 /**
@@ -155,8 +156,8 @@ void handleIRRequest(AsyncWebServerRequest *request) {
 void checkWiFiSignal() {
   if (WiFi.status() == WL_CONNECTED) {
     long rssi = WiFi.RSSI();
-    String quality = (rssi > -50) ? "Excellent" : (rssi > -70) ? "Good" : (rssi > -80) ? "Fair" : "Poor";
     if (rssi > -80) {
+      String quality = (rssi > -50) ? "Excellent" : (rssi > -70) ? "Good" : (rssi > -80) ? "Fair" : "Poor";
       String logMsg = "WiFi Signal: " + String(rssi) + " dBm (" + quality + ")";
       addToLog(logMsg.c_str()); 
     }
@@ -174,6 +175,7 @@ void setup() {
   preferences.begin("neeo", false);
   brainName = preferences.getString("brain_name", "neeo");
   timezonePosix = preferences.getString("tz_info", "CET-1CEST,M3.5.0,M10.5.0/3");
+  timezoneName = preferences.getString("tz_name", "Europe/Amsterdam"); // Nieuw: match op naam
   debugEnabled = preferences.getBool("debug_logs", true); 
   preferences.end();
 
@@ -207,37 +209,39 @@ void setup() {
     
     html += "<h1>NEEO Dashboard</h1>";
     
+    // Blok 1: Blink & Diag
     html += "<div class='card'><h3>Blink & Diag</h3><div class='grid'>";
     html += "<button class='red' onclick=\"fetch('/blink?mode=red')\">RED</button>";
     html += "<button class='white' onclick=\"fetch('/blink?mode=white')\">WHITE</button>";
     html += "<button onclick=\"fetch('/diag')\">Run Diag</button>";
     html += "<button onclick=\"fetch('/neighbors')\">Neighbors</button></div></div>";
 
+    // Blok 2: Press Simulation
     html += "<div class='card'><h3>Press Simulation</h3><div class='grid'>";
     html += "<button onclick=\"fetch('/ShortPress')\">ShortPress</button>";
     html += "<button onclick=\"fetch('/LongPress')\">LongPress</button></div></div>";
 
+    // Blok 3: Configuration
     html += "<div class='card'><h3>Configuration</h3><form action='/save' method='POST'>";
     html += "Brain Name:<br><input type='text' name='brain' value='" + brainName + "'><br><br>";
-    html += "Location:<br><select id='tzSelect' onchange='document.getElementById(\"tzPosix\").value=this.value'><option>Loading list...</option></select><br><br>";
+    html += "Location:<br><select id='tzSelect' onchange='updateTZFields(this)'><option>Loading...</option></select><br><br>";
+    html += "<input type='hidden' name='tz_name' id='tzName' value='" + timezoneName + "'>";
     html += "POSIX String:<br><input type='text' name='tz_posix' id='tzPosix' value='" + timezonePosix + "'><br><br>";
     html += "Debug Logs: <input type='checkbox' name='debug' " + String(debugEnabled ? "checked" : "") + "><br><br>";
     html += "<input type='submit' value='Save & Restart'></form></div>";
 
+    // Blok 4: Log (met auto-update)
     html += "<div class='card'><h3>Log</h3><pre id='log'>" + getFullLog() + "</pre>";
     html += "<button onclick=\"fetch('/clearlog').then(()=>location.reload())\">Clear Log</button></div>";
- 
-    html += "<div class='card'><h3>Network Settings</h3>";
-    html += "<p>Current SSID: <b>" + WiFi.SSID() + "</b></p>";
-    html += "<button class='red' onclick='confirmWifiReset()'>Change WiFi Network</button></div>";
+
+    // Blok 5: WiFi Reset
+    html += "<div class='card'><h3>Network Settings</h3><p>Current SSID: <b>" + WiFi.SSID() + "</b></p>";
+    html += "<button class='red' onclick=\"if(confirm('Reset WiFi?')) fetch('/reset_wifi', {method:'POST'})\">Change WiFi Network</button></div>";
 
     html += "<script>";
-    html += "function confirmWifiReset() {";
-    html += "  if(confirm('Wilt u de WiFi-instellingen wissen en een nieuwe verbinding instellen? De device herstart naar de setup portal.')) {";
-    html += "    fetch('/reset_wifi', {method: 'POST'}).then(() => {";
-    html += "      alert('Instellingen gewist. Zoek naar de NEEO-Border-Router hotspot op je telefoon.');";
-    html += "    });";
-    html += "  }";
+    html += "function updateTZFields(sel) {";
+    html += "  document.getElementById('tzPosix').value = sel.value;";
+    html += "  document.getElementById('tzName').value = sel.options[sel.selectedIndex].text;";
     html += "}";
     html += "async function loadTZ() {";
     html += "  try {";
@@ -245,19 +249,20 @@ void setup() {
     html += "    const text = await res.text();";
     html += "    const lines = text.split('\\n');";
     html += "    const select = document.getElementById('tzSelect');";
-    html += "    select.innerHTML = '<option value=\"\">Select a location...</option>';";
+    html += "    const savedName = '" + timezoneName + "';";
+    html += "    select.innerHTML = '';";
     html += "    lines.forEach(line => {";
     html += "      const parts = line.split('\",\"');";
     html += "      if(parts.length >= 2) {";
     html += "        const name = parts[0].replace(/\"/g, '');";
-    html += "        const posix = parts[1].replace(/\"/g, '');";
+    html += "        const posix = parts[1].replace(/\"/g, '').trim();";
     html += "        const opt = document.createElement('option');";
     html += "        opt.value = posix; opt.innerText = name;";
-    html += "        if(posix === '" + timezonePosix + "') opt.selected = true;";
+    html += "        if(name === savedName) opt.selected = true;";
     html += "        select.appendChild(opt);";
     html += "      }";
     html += "    });";
-    html += "  } catch(e) { console.error('TZ Load error', e); }";
+    html += "  } catch(e) { console.error(e); }";
     html += "}";
     html += "loadTZ();";
     html += "setInterval(()=>{fetch('/log').then(r=>r.text()).then(t=>{const e=document.getElementById('log');e.innerText=t;e.scrollTop=e.scrollHeight;});},2000);";
@@ -269,14 +274,25 @@ void setup() {
   // Save Settings Handler
   server.on("/save", HTTP_POST, [](AsyncWebServerRequest *request){
     preferences.begin("neeo", false);
-    if (request->hasParam("brain", true)) preferences.putString("brain_name", request->getParam("brain", true)->value());
-    if (request->hasParam("tz_posix", true)) preferences.putString("tz_info", request->getParam("tz_posix", true)->value());
-    preferences.putBool("debug_logs", request->hasParam("debug", true));
+    if (request->hasParam("brain", true)) {
+      brainName = request->getParam("brain", true)->value();
+      preferences.putString("brain_name", brainName);
+    }
+    if (request->hasParam("tz_posix", true)) {
+      timezonePosix = request->getParam("tz_posix", true)->value();
+      preferences.putString("tz_info", timezonePosix);
+    }
+    if (request->hasParam("tz_name", true)) {
+      timezoneName = request->getParam("tz_name", true)->value();
+      preferences.putString("tz_name", timezoneName);
+    }
+    debugEnabled = request->hasParam("debug", true);
+    preferences.putBool("debug_logs", debugEnabled);
     preferences.end();
     
     addToLog("SYS: Settings saved, restarting...");
-    request->send(200, "text/plain", "OK");
-    delay(500); ESP.restart();
+    request->send(200, "text/plain", "OK. Restarting...");
+    delay(1000); ESP.restart();
   });
 
   // Blink LED Handler
@@ -284,76 +300,45 @@ void setup() {
     String mode = request->hasParam("mode", true) ? request->getParam("mode", true)->value() : "off";
     uint8_t cmd = (mode == "red") ? 0x11 : (mode == "white") ? 0x21 : 0x00;
     Serial2.write(cmd);
-    char logMsg[32];
-    snprintf(logMsg, sizeof(logMsg), "WEB: Blink command [%s]", mode.c_str());
-    addToLog(logMsg);
+    addToLog(("WEB: Blink command [" + mode + "]").c_str());
     request->send(200, "text/plain", "OK");
   });
 
-  // Neighbor Fetch Handler
+  // Neighbor Handler
   server.on("/neighbors", HTTP_ANY, [](AsyncWebServerRequest *request){
-    addToLog("WEB: Fetching neighbors...");
     Serial2.write(0x05); 
     String response = ""; unsigned long timeout = millis() + 450;
     while (millis() < timeout) { while (Serial2.available()) response += (char)Serial2.read(); yield(); }
     request->send(200, "text/plain", response);
   });
 
-  // Security Key Handler
+  // Security & IR Handlers
   auto handleSecurity = [](AsyncWebServerRequest *request) {
-    bool isDisc = (request->url() == "/discovery");
-    char cmd = isDisc ? 'K' : 'E';
+    char cmd = (request->url() == "/discovery") ? 'K' : 'E';
     if (request->hasParam("airkey", true)) {
       String ak = request->getParam("airkey", true)->value();
       Serial2.write('!'); Serial2.write(cmd); Serial2.print(ak); Serial2.write('\n');
-      addToLog(("SECURITY: Updating " + String(isDisc?"Discovery":"Encryption") + " key").c_str());
       request->send(200, "text/plain", "OK");
     } else { request->send(400, "text/plain", "Missing key"); }
   };
   server.on("/discovery", HTTP_ANY, handleSecurity);
   server.on("/encryption", HTTP_ANY, handleSecurity);
-
   server.on("/ir", HTTP_ANY, handleIRRequest);
   server.on("/sendir", HTTP_ANY, handleIRRequest);
 
-  server.on("/diag", HTTP_ANY, [](AsyncWebServerRequest *request){ 
-    addToLog("WEB: Triggered Pin Diagnostic");
-    performPinDiagnostic(); 
-    request->send(200, "text/plain", "Started"); 
-  });
-
-  server.on("/ShortPress", HTTP_ANY, [](AsyncWebServerRequest *request){ 
-    addToLog("WEB: Simulated ShortPress");
-    sendBrainRequest("/v1/api/TouchButton"); 
-    request->send(200, "text/plain", "OK"); 
-  });
-
-  server.on("/LongPress", HTTP_ANY, [](AsyncWebServerRequest *request){ 
-    addToLog("WEB: Simulated LongPress");
-    sendBrainRequest("/v1/api/longTouchButton"); 
-    request->send(200, "text/plain", "OK"); 
-  });
-
+  server.on("/diag", HTTP_ANY, [](AsyncWebServerRequest *request){ performPinDiagnostic(); request->send(200, "text/plain", "Started"); });
+  server.on("/ShortPress", HTTP_ANY, [](AsyncWebServerRequest *request){ sendBrainRequest("/v1/api/TouchButton"); request->send(200, "text/plain", "OK"); });
+  server.on("/LongPress", HTTP_ANY, [](AsyncWebServerRequest *request){ sendBrainRequest("/v1/api/longTouchButton"); request->send(200, "text/plain", "OK"); });
   server.on("/log", HTTP_ANY, [](AsyncWebServerRequest *request){ request->send(200, "text/plain", getFullLog()); });
-  server.on("/clearlog", HTTP_ANY, [](AsyncWebServerRequest *request){ 
-    addToLog("SYS: Log cleared");
-    bufferFull=false; logIndex=0; request->send(200, "text/plain", "Cleared"); 
-  });
+  server.on("/clearlog", HTTP_ANY, [](AsyncWebServerRequest *request){ bufferFull=false; logIndex=0; request->send(200, "text/plain", "Cleared"); });
 
-  // WiFi SSID Change Handler
   server.on("/reset_wifi", HTTP_POST, [](AsyncWebServerRequest *request){
-    addToLog("SYS: WiFi Reset triggered. Erasing settings and entering Config Portal...");
     request->send(200, "text/plain", "OK");
-    delay(1000);
-    WiFiManager wm;
-    wm.resetSettings(); // Wist de NVS-geheugen van WiFiManager
-    WiFi.disconnect(true, true); 
-    ESP.restart();
+    delay(1000); WiFiManager wm; wm.resetSettings(); ESP.restart();
   });
 
   server.begin();
   tcpBridge.begin();
-  tcpBridge.setNoDelay(true);
   addToLog("Services Online");
   delay(500); 
 }
