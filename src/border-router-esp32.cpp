@@ -3,13 +3,22 @@
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <WiFiManager.h> 
-
+#include "esp_bt.h"
 #include <ESPAsyncWebServer.h>
 #include <HTTPClient.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <IPAddress.h>
 #include "time.h"
+#include <WiFiUdp.h>
+
+/* --- Forward Declarations --- */
+void addToLog(const char* source, const char* service, const char* msg);
+void processAction(const uint8_t* data, size_t len, const char* source, const char* service);
+void processIncomingJennic(const uint8_t* data, size_t len);
+String getFullLog();
+void sendBrainRequest(String path);
+void performPinDiagnostic();
 
 /* --- Hardware Configuration --- */
 #define RX2_PIN      16
@@ -17,369 +26,420 @@
 #define BUTTON_PIN   4       
 #define E75_BAUD     500000  
 
-/* --- NTP Settings --- */
 const char* ntpServer = "pool.ntp.org";
 
-/* --- Static Ring Buffer (Memory Safe Logging) --- */
+/* --- Static Ring Buffer --- */
 const int MAX_LOG_LINES = 50;
-const int MAX_LINE_LEN = 120;
+const int MAX_LINE_LEN = 150; 
 char logBuffer[MAX_LOG_LINES][MAX_LINE_LEN];
 int logIndex = 0;
 bool bufferFull = false;
 
-/**
- * Adds a message to the internal ring buffer with a timestamp.
- */
-void addToLog(const char* msg) {
-  struct tm timeinfo;
-  char tStr[12];
-  if(!getLocalTime(&timeinfo)) strcpy(tStr, "[00:00:00]");
-  else strftime(tStr, sizeof(tStr), "[%H:%M:%S]", &timeinfo);
-  
-  snprintf(logBuffer[logIndex], MAX_LINE_LEN, "%s %s", tStr, msg);
-  logIndex = (logIndex + 1) % MAX_LOG_LINES;
-  if (logIndex == 0) bufferFull = true;
-  Serial.println(msg); 
-}
+/* --- State Management --- */
+AsyncWebServer server(80);           
+AsyncWebServer bridgeServer(8080);   
+WiFiUDP udp;
 
-/**
- * Returns the full log as a single String for the web interface.
- */
-String getFullLog() {
-  String output = "";
-  output.reserve(4000); 
-  int start = bufferFull ? logIndex : 0;
-  int count = bufferFull ? MAX_LOG_LINES : logIndex;
-  for (int i = 0; i < count; i++) {
-    output += String(logBuffer[(start + i) % MAX_LOG_LINES]) + "\n";
-  }
-  return output;
-}
-
-/* --- Servers & State Management --- */
-AsyncWebServer server(8080);
-WiFiServer tcpBridge(60001); 
-WiFiClient bridgeClient;      
 Preferences preferences;
 
 String brainName;
 String timezonePosix;
-String timezoneName; 
+String timezoneName; // This was missing
 bool debugEnabled = true;
+bool triggerShortPress = false;
+bool triggerLongPress = false;
 
-/**
- * Disables unused GPIO pins to prevent noise/interference.
- */
-void disableUnusedPins() {
-    int unusedPins[] = {13, 14, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33};
-    for (int i = 0; i < sizeof(unusedPins) / sizeof(unusedPins[0]); i++) {
-        pinMode(unusedPins[i], INPUT_PULLUP);
+const int udpPort = 4000; 
+IPAddress targetIP(0,0,0,0);
+unsigned long lastDiscovery = 0;
+
+
+/* --- Core Functions --- */
+
+void addToLog(const char* source, const char* service, const char* msg) {
+    struct tm timeinfo;
+    char tStr[25]; 
+    if(!getLocalTime(&timeinfo)) {
+        strcpy(tStr, "[00-00-00 00:00:00]");
+    } else {
+        strftime(tStr, sizeof(tStr), "[%y-%m-%d %H:%M:%S]", &timeinfo);
+    }
+    // Alignment: source at 6 chars, service at 11 chars
+    snprintf(logBuffer[logIndex], MAX_LINE_LEN, "%s [%-6s] [%-11s] %s", tStr, source, service, msg);
+    Serial.println(logBuffer[logIndex]); 
+    logIndex = (logIndex + 1) % MAX_LOG_LINES;
+    if (logIndex == 0) bufferFull = true;
+}
+
+String getFullLog() {
+    String output = "";
+    output.reserve(4000);
+    int start = bufferFull ? logIndex : 0;
+    int count = bufferFull ? MAX_LOG_LINES : logIndex;
+    for (int i = 0; i < count; i++) {
+        output += String(logBuffer[(start + i) % MAX_LOG_LINES]) + "\n";
+    }
+    return output;
+}
+
+void processAction(const uint8_t* data, size_t len, const char* source, const char* service) {
+    Serial2.write(data, len);
+    if (debugEnabled) {
+        char hexData[100] = {0};
+        for(size_t i = 0; i < len && i < 25; i++) {
+            char buf[5];
+            snprintf(buf, sizeof(buf), "%02X ", data[i]);
+            strcat(hexData, buf);
+        }
+        char logEntry[MAX_LINE_LEN];
+        snprintf(logEntry, sizeof(logEntry), "via %s (%d bytes) HEX: %s", source, (int)len, hexData);
+        addToLog("jn5168", service, logEntry);
     }
 }
 
-/* --- Helpers --- */
+void processIncomingJennic(const uint8_t* data, size_t len) {
+    if (len < 1) return;
+    const char* type = "unknown";
+    bool isCoAP = false;
 
-/**
- * Sends a GET request to the NEEO Brain.
- */
+    // 1. Type recognition
+    if (data[0] == '!') {
+        if (data[1] == 'S') type = "!s (tx)";
+        else if (data[1] == 'R') type = "!r (ack)";
+        else if (data[1] == 'M') type = "!m (mgmt)";
+    } 
+    else if (data[0] == 0x49) type = "incoming";
+
+    // 2. CoAP/UDP Detection (Often after 6LoWPAN header, look for 0x40/0x50/0x60/0x70)
+    // CoAP version 1 always starts with 01 in the first two bits (0x40)
+    for (size_t i = 0; i < len - 4; i++) {
+        if (data[i] == 0x40 || data[i] == 0x50 || data[i] == 0x60) {
+            isCoAP = true;
+            break;
+        }
+    }
+
+    // 3. ASCII/XML Scanner & Security Filter
+    String readableData = "";
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] >= 32 && data[i] <= 126) {
+            readableData += (char)data[i];
+        } else if (readableData.length() > 0 && !readableData.endsWith(" ")) {
+            readableData += " ";
+        }
+    }
+    
+    // Translate XML entities
+    readableData.replace("&#x2F;", "/");
+    
+    // SECURITY FILTER: Mask the WiFi password in the log
+    if (readableData.indexOf("<p>") != -1) {
+        int start = readableData.indexOf("<p>") + 3;
+        int end = readableData.indexOf("</p>");
+        if (end > start) {
+            String pass = readableData.substring(start, end);
+            readableData.replace(pass, "********");
+        }
+    }
+
+    // 4. Build log entry
+    char msg[MAX_LINE_LEN];
+    if (isCoAP) {
+        snprintf(msg, sizeof(msg), "COAP PUSH: %s", readableData.length() > 5 ? readableData.c_str() : "[Binary CoAP]");
+    } else if (readableData.length() > 15) {
+        snprintf(msg, sizeof(msg), "DATA: %s", readableData.substring(0, 110).c_str());
+    } else {
+        // Hex display for small packets/handshakes
+        char hexBuf[40] = {0};
+        for(size_t j=0; j<10 && j<len; j++) {
+            char b[4]; snprintf(b, 4, "%02X ", data[j]); strcat(hexBuf, b);
+        }
+        snprintf(msg, sizeof(msg), "HEX: %s", hexBuf);
+    }
+    
+    addToLog("jn5168", type, msg);
+}
+
 void sendBrainRequest(String path) {
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    String url = "http://" + brainName + ":3000" + path;
-    http.begin(url);
-    int httpCode = http.GET();
-    char logMsg[80];
-    snprintf(logMsg, sizeof(logMsg), "BRAIN REQ -> %s (Code: %d)", path.c_str(), httpCode);
-    addToLog(logMsg);
-    http.end();
-  }
+    if (WiFi.status() == WL_CONNECTED && targetIP.toString() != "0.0.0.0") {
+        HTTPClient http;
+        String url = "http://" + targetIP.toString() + ":3000" + path;
+        http.begin(url);
+        int httpCode = http.GET();
+        
+        char logMsg[100];
+        snprintf(logMsg, sizeof(logMsg), "REQ -> %s (Code: %d)", path.c_str(), httpCode);
+        addToLog("http", "brain", logMsg);
+        http.end();
+        
+        // If Brain doesn't respond (e.g. IP changed), reset targetIP to search again
+        if (httpCode < 0) targetIP = IPAddress(0,0,0,0);
+    }
 }
 
-/**
- * Performs a diagnostic sequence to check pin communication.
- */
 void performPinDiagnostic() {
-  addToLog("Diagnostic: Starting Pin-Check sequence");
-  Serial2.write(0x11); delay(500); 
-  Serial2.write(0x21); delay(500); 
-  uint8_t dummyIR[] = {'!', 'I', 0x94, 0x70, 0x01, 0x00, 0x05, 'E'};
-  Serial2.write(dummyIR, sizeof(dummyIR));
-  delay(500); Serial2.write(0x00); 
+    addToLog("diag", "sequence", "Starting Pin-Check sequence");
+    uint8_t c1 = 0x11; processAction(&c1, 1, "diag", "/led_red"); delay(500); 
+    uint8_t c2 = 0x21; processAction(&c2, 1, "diag", "/led_white"); delay(500); 
+    uint8_t dummyIR[] = {'!', 'I', 0x94, 0x70, 0x01, 0x00, 0x05, 'E'};
+    processAction(dummyIR, sizeof(dummyIR), "diag", "/ir_test"); delay(500); 
+    uint8_t c0 = 0x00; processAction(&c0, 1, "diag", "/led_off");
 }
 
-/* --- IR Request Handler --- */
 void handleIRRequest(AsyncWebServerRequest *request) {
-  uint32_t vals[150];
-  int count = 0;
-  uint16_t freq = 38000;
-  String pulseData = "";
-
-  bool hasS = request->hasParam("s") || request->hasParam("s", true);
-  if (hasS) {
-    pulseData = request->getParam("s", request->hasParam("s", true))->value();
-    pulseData.replace('.', ','); 
-    
-    bool hasF = request->hasParam("f") || request->hasParam("f", true);
-    if (hasF) freq = request->getParam("f", request->hasParam("f", true))->value().toInt();
-    
-    int lastPos = 0, nextPos = 0;
-    while ((nextPos = pulseData.indexOf(',', lastPos)) != -1 && count < 150) {
-      vals[count++] = pulseData.substring(lastPos, nextPos).toInt();
-      lastPos = nextPos + 1;
-    }
-    vals[count++] = pulseData.substring(lastPos).toInt();
-  } else {
-    request->send(400, "text/plain", "Missing 's' parameter");
-    return;
-  }
-
-  Serial2.write('!'); Serial2.write('I');
-  Serial2.write(highByte(freq)); Serial2.write(lowByte(freq));
-  Serial2.write((uint8_t)count);
-  for (int i = 0; i < count; i++) {
-    uint16_t t = (uint16_t)vals[i];
-    Serial2.write(highByte(t)); Serial2.write(lowByte(t));
-  }
-  Serial2.write('E');
-  
-  if(debugEnabled) {
-    char logMsg[64];
-    snprintf(logMsg, sizeof(logMsg), "IR: Sent %d pulses @ %dHz", count, freq);
-    addToLog(logMsg);
-  }
-  request->send(200, "text/plain", "OK");
+    uint32_t vals[150];
+    int count = 0;
+    uint16_t freq = 38000;
+    bool isPost = request->hasParam("s", true);
+    if (request->hasParam("s") || isPost) {
+        String pulseData = request->getParam("s", isPost)->value();
+        pulseData.replace('.', ','); 
+        if (request->hasParam("f", isPost)) freq = (uint16_t)request->getParam("f", isPost)->value().toInt();
+        int lastPos = 0, nextPos = 0;
+        while ((nextPos = pulseData.indexOf(',', lastPos)) != -1 && count < 150) {
+            vals[count++] = (uint32_t)pulseData.substring(lastPos, nextPos).toInt();
+            lastPos = nextPos + 1;
+        }
+        vals[count++] = (uint32_t)pulseData.substring(lastPos).toInt();
+        size_t pSize = 5 + (count * 2) + 1;
+        uint8_t* irBuf = (uint8_t*)malloc(pSize);
+        if(irBuf) {
+            int pIdx = 0;
+            irBuf[pIdx++] = '!'; irBuf[pIdx++] = 'I';
+            irBuf[pIdx++] = (uint8_t)(freq >> 8); irBuf[pIdx++] = (uint8_t)(freq & 0xFF);
+            irBuf[pIdx++] = (uint8_t)count;
+            for (int i = 0; i < count; i++) {
+                irBuf[pIdx++] = (uint8_t)(vals[i] >> 8); irBuf[pIdx++] = (uint8_t)(vals[i] & 0xFF);
+            }
+            irBuf[pIdx++] = 'E';
+            processAction(irBuf, pIdx, "web", "/ir_send");
+            free(irBuf);
+            request->send(200);
+        }
+    } else { request->send(400); }
 }
 
-/**
- * Checks and logs the WiFi signal strength (RSSI).
- */
-void checkWiFiSignal() {
-  if (WiFi.status() == WL_CONNECTED) {
-    long rssi = WiFi.RSSI();
-    if (rssi > -80) {
-      String quality = (rssi > -50) ? "Excellent" : (rssi > -70) ? "Good" : (rssi > -80) ? "Fair" : "Poor";
-      String logMsg = "WiFi Signal: " + String(rssi) + " dBm (" + quality + ")";
-      addToLog(logMsg.c_str()); 
+void handleUnifiedCommand(AsyncWebServerRequest *request, const char* source) {
+    String path = request->url();
+    const char* pC = path.c_str();
+    if (path.indexOf("/blink") != -1) {
+        String mode = request->hasParam("mode") ? request->getParam("mode")->value() : "off";
+        uint8_t cmd = (mode == "red") ? 0x11 : (mode == "white") ? 0x21 : 0x00;
+        processAction(&cmd, 1, source, pC);
+        request->send(200);
+    } 
+    else if (path.indexOf("/neighbors") != -1 || path.indexOf("/discovery") != -1) {
+        uint8_t cmd = 0x05;
+        processAction(&cmd, 1, source, pC);
+        request->send(200);
     }
-  }
+    else if (path.indexOf("/encryption") != -1) {
+        uint8_t enc[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05};
+        processAction(enc, sizeof(enc), source, pC);
+        request->send(200);
+    }
+    else if (path.indexOf("/diag") != -1) { 
+        performPinDiagnostic(); 
+        request->send(200); 
+    }
+    else if (path.indexOf("/stats") != -1) {
+        Serial.println("Stats need to be returned");
+        request->send(200, "application/json", "{\"status\":\"ok\",\"value\":66}"); 
+    }
+    else if (path.indexOf("/ShortPress") != -1) {
+        triggerShortPress = true; // Set flag only
+        request->send(200, "text/plain", "Triggered");
+    }
+    else if (path.indexOf("/LongPress") != -1) { 
+        triggerLongPress = true; // Set flag only
+        request->send(200, "text/plain", "Triggered");
+    }
 }
 
-/* --- Setup --- */
 void setup() {
-  Serial.begin(115200); 
-  Serial2.begin(E75_BAUD, SERIAL_8N1, RX2_PIN, TX2_PIN);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-
-  disableUnusedPins();
-
-  preferences.begin("neeo", false);
-  brainName = preferences.getString("brain_name", "neeo");
-  timezonePosix = preferences.getString("tz_info", "CET-1CEST,M3.5.0,M10.5.0/3");
-  timezoneName = preferences.getString("tz_name", "Europe/Amsterdam"); // Nieuw: match op naam
-  debugEnabled = preferences.getBool("debug_logs", true); 
-  preferences.end();
-
-  WiFi.persistent(true); 
-  WiFi.setSleep(false);  
-
-  connectWiFi(); 
-  
-  Serial.print("WiFi Connected. IP: ");
-  Serial.println(WiFi.localIP());
-  
-  configTime(0, 0, ntpServer);     
-  setenv("TZ", timezonePosix.c_str(), 1);        
-  tzset();                         
-
-  if (MDNS.begin((brainName + "-jn5168").c_str())) {
-      MDNS.addService("http", "tcp", 8080);
-      MDNS.addService("neeo-bridge", "tcp", 60001);
-  }
-
-  // Web Interface Handler
-  server.on("/", HTTP_ANY, [](AsyncWebServerRequest *request){
-    String html = "<html><head><title>NEEO Border Router</title>";
-    html += "<style>body{font-family:sans-serif;margin:20px;background:#f0f2f5;}";
-    html += ".card{background:white;padding:20px;border-radius:12px;box-shadow:0 4px 6px rgba(0,0,0,0.1);margin-bottom:20px;}";
-    html += ".grid{display:grid;grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));gap:10px;}";
-    html += "select, input[type=text]{padding:8px;border-radius:4px;border:1px solid #ccc;margin:5px 0;width:100%;max-width:400px;}";
-    html += "button, input[type=submit]{padding:12px;cursor:pointer;border-radius:6px;border:none;background:#007bff;color:white;font-weight:bold;}";
-    html += "button.red{background:#dc3545;} button.white{background:#e9ecef;color:#333;border:1px solid #ccc;}";
-    html += "pre{background:#222;color:#00ff00;padding:15px;border-radius:8px;height:250px;overflow-y:auto;font-size:12px;}</style></head><body>";
+    btStop();
+    esp_bt_controller_disable();
+    Serial.begin(115200); 
+    Serial2.begin(E75_BAUD, SERIAL_8N1, RX2_PIN, TX2_PIN);
     
-    html += "<h1>NEEO Dashboard</h1>";
-    
-    // Blok 1: Blink & Diag
-    html += "<div class='card'><h3>Blink & Diag</h3><div class='grid'>";
-    html += "<button class='red' onclick=\"fetch('/blink?mode=red')\">RED</button>";
-    html += "<button class='white' onclick=\"fetch('/blink?mode=white')\">WHITE</button>";
-    html += "<button onclick=\"fetch('/diag')\">Run Diag</button>";
-    html += "<button onclick=\"fetch('/neighbors')\">Neighbors</button></div></div>";
-
-    // Blok 2: Press Simulation
-    html += "<div class='card'><h3>Press Simulation</h3><div class='grid'>";
-    html += "<button onclick=\"fetch('/ShortPress')\">ShortPress</button>";
-    html += "<button onclick=\"fetch('/LongPress')\">LongPress</button></div></div>";
-
-    // Blok 3: Configuration
-    html += "<div class='card'><h3>Configuration</h3><form action='/save' method='POST'>";
-    html += "Brain Name:<br><input type='text' name='brain' value='" + brainName + "'><br><br>";
-    html += "Location:<br><select id='tzSelect' onchange='updateTZFields(this)'><option>Loading...</option></select><br><br>";
-    html += "<input type='hidden' name='tz_name' id='tzName' value='" + timezoneName + "'>";
-    html += "POSIX String:<br><input type='text' name='tz_posix' id='tzPosix' value='" + timezonePosix + "'><br><br>";
-    html += "Debug Logs: <input type='checkbox' name='debug' " + String(debugEnabled ? "checked" : "") + "><br><br>";
-    html += "<input type='submit' value='Save & Restart'></form></div>";
-
-    // Blok 4: Log (met auto-update)
-    html += "<div class='card'><h3>Log</h3><pre id='log'>" + getFullLog() + "</pre>";
-    html += "<button onclick=\"fetch('/clearlog').then(()=>location.reload())\">Clear Log</button></div>";
-
-    // Blok 5: WiFi Reset
-    html += "<div class='card'><h3>Network Settings</h3><p>Current SSID: <b>" + WiFi.SSID() + "</b></p>";
-    html += "<button class='red' onclick=\"if(confirm('Reset WiFi?')) fetch('/reset_wifi', {method:'POST'})\">Change WiFi Network</button></div>";
-
-    html += "<script>";
-    html += "function updateTZFields(sel) {";
-    html += "  document.getElementById('tzPosix').value = sel.value;";
-    html += "  document.getElementById('tzName').value = sel.options[sel.selectedIndex].text;";
-    html += "}";
-    html += "async function loadTZ() {";
-    html += "  try {";
-    html += "    const res = await fetch('https://raw.githubusercontent.com/nayarsystems/posix_tz_db/master/zones.csv');";
-    html += "    const text = await res.text();";
-    html += "    const lines = text.split('\\n');";
-    html += "    const select = document.getElementById('tzSelect');";
-    html += "    const savedName = '" + timezoneName + "';";
-    html += "    select.innerHTML = '';";
-    html += "    lines.forEach(line => {";
-    html += "      const parts = line.split('\",\"');";
-    html += "      if(parts.length >= 2) {";
-    html += "        const name = parts[0].replace(/\"/g, '');";
-    html += "        const posix = parts[1].replace(/\"/g, '').trim();";
-    html += "        const opt = document.createElement('option');";
-    html += "        opt.value = posix; opt.innerText = name;";
-    html += "        if(name === savedName) opt.selected = true;";
-    html += "        select.appendChild(opt);";
-    html += "      }";
-    html += "    });";
-    html += "  } catch(e) { console.error(e); }";
-    html += "}";
-    html += "loadTZ();";
-    html += "setInterval(()=>{fetch('/log').then(r=>r.text()).then(t=>{const e=document.getElementById('log');e.innerText=t;e.scrollTop=e.scrollHeight;});},2000);";
-    html += "</script></body></html>";
-    
-    request->send(200, "text/html", html);
-  });
-
-  // Save Settings Handler
-  server.on("/save", HTTP_POST, [](AsyncWebServerRequest *request){
     preferences.begin("neeo", false);
-    if (request->hasParam("brain", true)) {
-      brainName = request->getParam("brain", true)->value();
-      preferences.putString("brain_name", brainName);
-    }
-    if (request->hasParam("tz_posix", true)) {
-      timezonePosix = request->getParam("tz_posix", true)->value();
-      preferences.putString("tz_info", timezonePosix);
-    }
-    if (request->hasParam("tz_name", true)) {
-      timezoneName = request->getParam("tz_name", true)->value();
-      preferences.putString("tz_name", timezoneName);
-    }
-    debugEnabled = request->hasParam("debug", true);
-    preferences.putBool("debug_logs", debugEnabled);
+    brainName = preferences.getString("brain_name", "neeo");
+    timezonePosix = preferences.getString("tz_info", "CET-1CEST,M3.5.0,M10.5.0/3");
+    debugEnabled = preferences.getBool("debug_logs", true); 
     preferences.end();
     
-    addToLog("SYS: Settings saved, restarting...");
-    request->send(200, "text/plain", "OK. Restarting...");
-    delay(1000); ESP.restart();
-  });
+    connectWiFi(); 
+    configTime(0, 0, ntpServer);     
+    setenv("TZ", timezonePosix.c_str(), 1); 
+    tzset();
+    
+    udp.begin(4000);
+    if (MDNS.begin((brainName + "-jn5168").c_str())) {
+        MDNS.addService("http", "tcp", 80);
+    }
 
-  // Blink LED Handler
-  server.on("/blink", HTTP_ANY, [](AsyncWebServerRequest *request){
-    String mode = request->hasParam("mode", true) ? request->getParam("mode", true)->value() : "off";
-    uint8_t cmd = (mode == "red") ? 0x11 : (mode == "white") ? 0x21 : 0x00;
-    Serial2.write(cmd);
-    addToLog(("WEB: Blink command [" + mode + "]").c_str());
-    request->send(200, "text/plain", "OK");
-  });
+    auto sharedHandler = [](AsyncWebServerRequest *request) {
+        if (request->client()->localPort() == 8080 && targetIP == IPAddress(0,0,0,0)) {
+            targetIP = request->client()->remoteIP();
+            
+            String msg = "First Bridge Call! TargetIP set to: " + targetIP.toString();
+            addToLog("sys", "bridge_init", msg.c_str());
+            Serial.println("[BRIDGE] " + msg);
+        }
+        const char* source = (request->client()->localPort() == 8080) ? "p_8080" : "p_80";
+        handleUnifiedCommand(request, source);
+    };
 
-  // Neighbor Handler
-  server.on("/neighbors", HTTP_ANY, [](AsyncWebServerRequest *request){
-    Serial2.write(0x05); 
-    String response = ""; unsigned long timeout = millis() + 450;
-    while (millis() < timeout) { while (Serial2.available()) response += (char)Serial2.read(); yield(); }
-    request->send(200, "text/plain", response);
-  });
+    server.on("/", HTTP_ANY, [](AsyncWebServerRequest *request){ 
+        #include "index.h"
+        request->send(200, "text/html", html); 
+    });
 
-  // Security & IR Handlers
-  auto handleSecurity = [](AsyncWebServerRequest *request) {
-    char cmd = (request->url() == "/discovery") ? 'K' : 'E';
-    if (request->hasParam("airkey", true)) {
-      String ak = request->getParam("airkey", true)->value();
-      Serial2.write('!'); Serial2.write(cmd); Serial2.print(ak); Serial2.write('\n');
-      request->send(200, "text/plain", "OK");
-    } else { request->send(400, "text/plain", "Missing key"); }
-  };
-  server.on("/discovery", HTTP_ANY, handleSecurity);
-  server.on("/encryption", HTTP_ANY, handleSecurity);
-  server.on("/ir", HTTP_ANY, handleIRRequest);
-  server.on("/sendir", HTTP_ANY, handleIRRequest);
+    server.on("/blink", HTTP_ANY, sharedHandler);
+    bridgeServer.on("/blink", HTTP_ANY, sharedHandler);
+    server.on("/neighbors", HTTP_ANY, sharedHandler);
+    bridgeServer.on("/neighbors", HTTP_ANY, sharedHandler);
+    bridgeServer.on("/stats", HTTP_ANY, sharedHandler);
+    server.on("/discovery", HTTP_ANY, sharedHandler);
+    bridgeServer.on("/discovery", HTTP_ANY, sharedHandler);
+    server.on("/encryption", HTTP_ANY, sharedHandler);
+    bridgeServer.on("/encryption", HTTP_ANY, sharedHandler);
+    server.on("/diag", HTTP_ANY, sharedHandler);
+    server.on("/ShortPress", HTTP_ANY, sharedHandler);
+    server.on("/LongPress", HTTP_ANY, sharedHandler);
+    server.on("/v1/api/ir", HTTP_POST, handleIRRequest);
 
-  server.on("/diag", HTTP_ANY, [](AsyncWebServerRequest *request){ performPinDiagnostic(); request->send(200, "text/plain", "Started"); });
-  server.on("/ShortPress", HTTP_ANY, [](AsyncWebServerRequest *request){ sendBrainRequest("/v1/api/TouchButton"); request->send(200, "text/plain", "OK"); });
-  server.on("/LongPress", HTTP_ANY, [](AsyncWebServerRequest *request){ sendBrainRequest("/v1/api/longTouchButton"); request->send(200, "text/plain", "OK"); });
-  server.on("/log", HTTP_ANY, [](AsyncWebServerRequest *request){ request->send(200, "text/plain", getFullLog()); });
-  server.on("/clearlog", HTTP_ANY, [](AsyncWebServerRequest *request){ bufferFull=false; logIndex=0; request->send(200, "text/plain", "Cleared"); });
+    // Log endpoint for automatic refresh (AJAX)
+    server.on("/log", HTTP_GET, [](AsyncWebServerRequest *request){
+        request->send(200, "text/plain", getFullLog());
+    });
 
-  server.on("/reset_wifi", HTTP_POST, [](AsyncWebServerRequest *request){
-    request->send(200, "text/plain", "OK");
-    delay(1000); WiFiManager wm; wm.resetSettings(); ESP.restart();
-  });
+    // Save settings
+    server.on("/save", HTTP_POST, [](AsyncWebServerRequest *request){
+        if(request->hasParam("brain", true)) brainName = request->getParam("brain", true)->value();
+        if(request->hasParam("tz_posix", true)) timezonePosix = request->getParam("tz_posix", true)->value();
+        if(request->hasParam("tz_name", true)) timezoneName = request->getParam("tz_name", true)->value();
+        debugEnabled = request->hasParam("debug", true);
 
-  server.begin();
-  tcpBridge.begin();
-  addToLog("Services Online");
-  delay(500); 
+        preferences.begin("neeo", false);
+        preferences.putString("brain_name", brainName);
+        preferences.putString("tz_info", timezonePosix);
+        preferences.putString("tz_name", timezoneName);
+        preferences.putBool("debug_logs", debugEnabled);
+        preferences.end();
+
+        request->send(200, "text/html", "Settings Saved. Restarting... <meta http-equiv='refresh' content='2;url=/'>");
+        delay(1000);
+        ESP.restart();
+    });
+
+    // Clear log
+    server.on("/clearlog", HTTP_ANY, [](AsyncWebServerRequest *request){
+        logIndex = 0;
+        bufferFull = false;
+        for(int i=0; i<MAX_LOG_LINES; i++) memset(logBuffer[i], 0, MAX_LINE_LEN);
+        request->send(200);
+    });
+
+    // WiFi Reset
+    server.on("/reset_wifi", HTTP_POST, [](AsyncWebServerRequest *request){
+        request->send(200, "text/plain", "Resetting WiFi and Restarting...");
+        delay(1000);
+        WiFiManager wm;
+        wm.resetSettings();
+        ESP.restart();
+    });
+
+    server.onNotFound([](AsyncWebServerRequest *request) {
+        addToLog("GUI", "404", request->url().c_str());
+        request->send(404, "text/plain", "Not found");
+    });
+
+    bridgeServer.onNotFound([](AsyncWebServerRequest *request) {
+        addToLog("8080", "404", request->url().c_str());
+        request->send(404, "text/plain", "Not found");
+    });    
+
+    server.begin();
+    bridgeServer.begin();
+    addToLog("sys", "boot", "Dual Port Server Ready");
 }
 
 void loop() {
-  static unsigned long btnDownTime = 0;
-  static bool lastBtnState = HIGH;
-  bool btnState = digitalRead(BUTTON_PIN);
+    static uint8_t sBuf[512];
+    static size_t sIdx = 0;
+    static bool escaped = false;
 
-  if (btnState == LOW && lastBtnState == HIGH) btnDownTime = millis();
-  else if (btnState == HIGH && lastBtnState == LOW) {
-    if ((millis() - btnDownTime) > 50) {
-      addToLog("BTN: Physical press");
-      sendBrainRequest("/v1/api/TouchButton");
+    // --- 1. SERIAL PROCESSING (SLIP Protocol) ---
+    while (Serial2.available()) {
+        uint8_t c = Serial2.read();
+        if (c == 0xC0) { // SLIP Boundary (End of packet)
+            if (sIdx > 0) {
+                processIncomingJennic(sBuf, sIdx);
+            }
+            sIdx = 0;
+            escaped = false;
+        } else if (c == 0xDB) { // SLIP Escape character
+            escaped = true;
+        } else {
+            if (escaped) {
+                if (c == 0xDC) c = 0xC0; 
+                else if (c == 0xDD) c = 0xDB;
+                escaped = false;
+            }
+            if (sIdx < sizeof(sBuf) - 1) {
+                sBuf[sIdx++] = c;
+            }
+        }
     }
-  }
-  lastBtnState = btnState;
 
-  if (tcpBridge.hasClient()) {
-    if (bridgeClient) bridgeClient.stop();
-    bridgeClient = tcpBridge.accept();
-    bridgeClient.setNoDelay(true);
-    addToLog("TCP: Client connected");
-  }
+    // --- 2. UDP DISCOVERY (Searching for the Brain) ---
+    if (WiFi.status() == WL_CONNECTED && targetIP.toString() == "0.0.0.0") {
+        if (millis() - lastDiscovery > 5000) { 
+            lastDiscovery = millis();
+            String Up_BrainName = brainName;
+            Up_BrainName.toUpperCase();
+            Serial.println("[UDP] Searching for Brain: WHERE_IS_NEEO->" + Up_BrainName);            
+            udp.beginPacket("255.255.255.255", udpPort);
+            udp.print("WHERE_IS_NEEO->" + Up_BrainName);
+            udp.endPacket();
+        }
+    }
 
-  if (bridgeClient && bridgeClient.available()) {
-    uint8_t buf[256];
-    size_t len = bridgeClient.read(buf, sizeof(buf));
-    Serial2.write(buf, len);
-  }
+    // Listen for response from Python script
+    if (WiFi.status() == WL_CONNECTED) {
+        int packetSize = udp.parsePacket();
+        if (packetSize) {
+            char reply[32];
+            int len = udp.read(reply, sizeof(reply) - 1);
+            if (len > 0) {
+                reply[len] = 0;
+                if (String(reply).indexOf("I_AM_NEEO") != -1) {
+                    targetIP = udp.remoteIP();
+                    String msg = "Brain found at: " + targetIP.toString();
+                    addToLog("sys", "Find_Brain", msg.c_str());
+                    Serial.println("[UDP] " + msg);
+                }
+            }
+        }
+    }
 
-  if (Serial2.available()) {
-    uint8_t buf[256];
-    size_t len = Serial2.readBytes(buf, min((int)Serial2.available(), 256));
-    if (bridgeClient && bridgeClient.connected()) bridgeClient.write(buf, len);
-    else if(debugEnabled) Serial.write(buf, len);
-  }
+    // --- 3. HTTP ACTIONS (Flag system to prevent Watchdog crashes) ---
+    if (triggerShortPress) {
+        triggerShortPress = false;
+        if (targetIP.toString() != "0.0.0.0") {
+            sendBrainRequest("/v1/api/TouchButton");
+        } else {
+            addToLog("http", "error", "No Brain IP; action cancelled");
+        }
+    }
 
-  static unsigned long lastCheck = 0;
-  if (millis() - lastCheck > 30000) { 
-    checkWiFiSignal();
-    lastCheck = millis();
-  }
+    if (triggerLongPress) {
+        triggerLongPress = false;
+        if (targetIP.toString() != "0.0.0.0") {
+            sendBrainRequest("/v1/api/longTouchButton");
+        } else {
+            addToLog("http", "error", "No Brain IP; action cancelled");
+        }
+    }
 }

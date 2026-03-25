@@ -2,7 +2,6 @@ String html = "<html><head><title>NEEO Border Router</title>";
 html += "<style>body{font-family:sans-serif;margin:20px;background:#f0f2f5;}";
 html += ".card{background:white;padding:20px;border-radius:12px;box-shadow:0 4px 6px rgba(0,0,0,0.1);margin-bottom:20px;}";
 html += ".grid{display:grid;grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));gap:10px;}";
-// CSS for horizontal alignment of config fields
 html += ".config-row { display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-end; margin-bottom: 15px; }";
 html += ".config-field { flex: 1; min-width: 200px; }";
 html += "select, input[type=text]{padding:8px;border-radius:4px;border:1px solid #ccc;margin:5px 0;width:100%;box-sizing:border-box;}";
@@ -44,11 +43,11 @@ html += "  document.getElementById('tzName').value = sel.options[sel.selectedInd
 html += "}";
 html += "async function loadTZ() {";
 html += "  try {";
-html += "    const res = await fetch('https://raw.githubusercontent.com/nayarsystems/posix_tz_db/master/zones.csv');";
+html += "    const res = await fetch('https://raw.githubusercontent.com');";
 html += "    const text = await res.text();";
 html += "    const lines = text.split('\\n');";
 html += "    const select = document.getElementById('tzSelect');";
-html += "    const savedName = '" + timezoneName + "';";
+html += "    const savedName = \"" + timezoneName + "\";";
 html += "    select.innerHTML = '';";
 html += "    lines.forEach(line => {";
 html += "      const parts = line.split('\",\"');";
