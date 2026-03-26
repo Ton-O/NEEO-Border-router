@@ -11,6 +11,8 @@
 #include <IPAddress.h>
 #include "time.h"
 #include <WiFiUdp.h>
+#include "index.h"
+
 
 /* --- Forward Declarations --- */
 void addToLog(const char* source, const char* service, const char* msg);
@@ -49,7 +51,7 @@ bool debugEnabled = true;
 bool triggerShortPress = false;
 bool triggerLongPress = false;
 
-const int udpPort = 3201; //4000; 
+const int udpPort = 3201;
 IPAddress targetIP(0,0,0,0);
 unsigned long lastDiscovery = 0;
 
@@ -290,11 +292,18 @@ void setup() {
         handleUnifiedCommand(request, source);
     };
 
-    server.on("/", HTTP_ANY, [](AsyncWebServerRequest *request){ 
-        #include "index.h"
-        request->send(200, "text/html", html); 
-    });
+server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    String html = String(FPSTR(INDEX_HTML));
 
+    html.replace("[[BRAIN]]", brainName);
+    html.replace("[[POSIX]]", timezonePosix);
+    html.replace("[[TZNAME]]", timezoneName);
+    html.replace("[[DEBUG_CHECKED]]", debugEnabled ? "checked" : "");
+    html.replace("[[LOG_CONTENT]]", getFullLog());
+    html.replace("[[WIFI_SSID]]", WiFi.SSID());
+
+    request->send(200, "text/html", html);
+});
     server.on("/blink", HTTP_ANY, sharedHandler);
     bridgeServer.on("/blink", HTTP_ANY, sharedHandler);
     server.on("/neighbors", HTTP_ANY, sharedHandler);
