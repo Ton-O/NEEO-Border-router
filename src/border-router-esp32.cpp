@@ -49,7 +49,7 @@ bool debugEnabled = true;
 bool triggerShortPress = false;
 bool triggerLongPress = false;
 
-const int udpPort = 4000; 
+const int udpPort = 3201; //4000; 
 IPAddress targetIP(0,0,0,0);
 unsigned long lastDiscovery = 0;
 
@@ -73,7 +73,7 @@ void addToLog(const char* source, const char* service, const char* msg) {
 
 String getFullLog() {
     String output = "";
-    output.reserve(4000);
+    output.reserve(udpPort);
     int start = bufferFull ? logIndex : 0;
     int count = bufferFull ? MAX_LOG_LINES : logIndex;
     for (int i = 0; i < count; i++) {
@@ -273,7 +273,7 @@ void setup() {
     setenv("TZ", timezonePosix.c_str(), 1); 
     tzset();
     
-    udp.begin(4000);
+    udp.begin(udpPort);
     if (MDNS.begin((brainName + "-jn5168").c_str())) {
         MDNS.addService("http", "tcp", 80);
     }
@@ -399,9 +399,10 @@ void loop() {
             lastDiscovery = millis();
             String Up_BrainName = brainName;
             Up_BrainName.toUpperCase();
-            Serial.println("[UDP] Searching for Brain: WHERE_IS_NEEO->" + Up_BrainName);            
+            String LookFor = "WHO_IS_NEEO->" + Up_BrainName;
+            addToLog("sys", "Get_BrainIP", LookFor.c_str() );
             udp.beginPacket("255.255.255.255", udpPort);
-            udp.print("WHERE_IS_NEEO->" + Up_BrainName);
+            udp.print("WHO_IS_NEEO->" + Up_BrainName);
             udp.endPacket();
         }
     }
@@ -418,7 +419,6 @@ void loop() {
                     targetIP = udp.remoteIP();
                     String msg = "Brain found at: " + targetIP.toString();
                     addToLog("sys", "Find_Brain", msg.c_str());
-                    Serial.println("[UDP] " + msg);
                 }
             }
         }
