@@ -55,6 +55,13 @@ const int udpPort = 3201;
 IPAddress targetIP(0,0,0,0);
 unsigned long lastDiscovery = 0;
 
+/* --- SLIP RX Buffer --- */
+#define MAX_SLIP_FRAME 512
+uint8_t slipRxBuf[MAX_SLIP_FRAME];
+int slipRxPtr = 0;
+bool isEscaping = false;
+
+
 
 /* --- Core Functions --- */
 
@@ -84,11 +91,29 @@ String getFullLog() {
     return output;
 }
 
+void sendSlipPacket(const uint8_t* data, size_t len) {
+    Serial2.write(0xC0); // Start-of-Frame
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] == 0xC0) {      // this is data but acts as the end-of-record indicator for a slip record, escape it first with DB, then DC
+            Serial2.write(0xDB);
+            Serial2.write(0xDC);
+        } else if (data[i] == 0xDB) { // this is the normal escape character for a slip record but now data, make sure it is handled correctly
+            Serial2.write(0xDB);
+            Serial2.write(0xDD);
+        } else {
+            Serial2.write(data[i]);
+        }
+    }
+    Serial2.write(0xC0); // End-of-Frame
+}
+
+
 void processAction(const uint8_t* data, size_t len, const char* source, const char* service) {
-    Serial2.write(data, len);
+    //Serial2.write(data, len);
+    sendSlipPacket(data, len); //Write slip-format
     if (debugEnabled) {
         char hexData[100] = {0};
-        for(size_t i = 0; i < len && i < 25; i++) {
+        for(size_t i = 0; i < len && i < 20; i++) {
             char buf[5];
             snprintf(buf, sizeof(buf), "%02X ", data[i]);
             strcat(hexData, buf);
@@ -100,60 +125,61 @@ void processAction(const uint8_t* data, size_t len, const char* source, const ch
 }
 
 void processIncomingJennic(const uint8_t* data, size_t len) {
-    if (len < 1) return;
+    if (len < 2) return; 
+
     const char* type = "unknown";
-    bool isCoAP = false;
-
-    // 1. Type recognition
-    if (data[0] == '!') {
-        if (data[1] == 'S') type = "!s (tx)";
-        else if (data[1] == 'R') type = "!r (ack)";
-        else if (data[1] == 'M') type = "!m (mgmt)";
-    } 
-    else if (data[0] == 0x49) type = "incoming";
-
-    // 2. CoAP/UDP Detection (Often after 6LoWPAN header, look for 0x40/0x50/0x60/0x70)
-    // CoAP version 1 always starts with 01 in the first two bits (0x40)
-    for (size_t i = 0; i < len - 4; i++) {
-        if (data[i] == 0x40 || data[i] == 0x50 || data[i] == 0x60) {
-            isCoAP = true;
-            break;
-        }
-    }
-
-    // 3. ASCII/XML Scanner & Security Filter
-    String readableData = "";
-    for (size_t i = 0; i < len; i++) {
-        if (data[i] >= 32 && data[i] <= 126) {
-            readableData += (char)data[i];
-        } else if (readableData.length() > 0 && !readableData.endsWith(" ")) {
-            readableData += " ";
-        }
-    }
-    
-    // Translate XML entities
-    readableData.replace("&#x2F;", "/");
-    
-    // SECURITY FILTER: Mask the WiFi password in the log
-    if (readableData.indexOf("<p>") != -1) {
-        int start = readableData.indexOf("<p>") + 3;
-        int end = readableData.indexOf("</p>");
-        if (end > start) {
-            String pass = readableData.substring(start, end);
-            readableData.replace(pass, "********");
-        }
-    }
-
-    // 4. Build log entry
     char msg[MAX_LINE_LEN];
-    if (isCoAP) {
-        snprintf(msg, sizeof(msg), "COAP PUSH: %s", readableData.length() > 5 ? readableData.c_str() : "[Binary CoAP]");
-    } else if (readableData.length() > 15) {
-        snprintf(msg, sizeof(msg), "DATA: %s", readableData.substring(0, 110).c_str());
-    } else {
-        // Hex display for small packets/handshakes
-        char hexBuf[40] = {0};
-        for(size_t j=0; j<10 && j<len; j++) {
+    memset(msg, 0, MAX_LINE_LEN);
+
+    // 1. Label herkenning op basis van de logs
+    if (data[0] == 0x21) { // De '!' prefix
+        switch(data[1]) {
+            case 0x4D: // 'M' - Management/Blink
+                type = "!m (status)";
+                // In jouw log: 21 4d 01 (Aan) of 21 4d 00 (Uit/Ready)
+                snprintf(msg, sizeof(msg), "JN Mode: %s", (data[2] == 0x01) ? "ACTIVE/BLINK" : "READY/IDLE");
+                break;
+
+            case 0x52: // 'R' - Neighbor Ack
+                type = "!r (ack)";
+                // Jouw log: 21 52 [index] 00 01 [LQI]
+                if (len >= 5) {
+                    snprintf(msg, sizeof(msg), "NBR Ack Index %02X | LQI: %02X", data[2], data[5]);
+                }
+                break;
+
+            case 0x49: // 'I' - Infrarood Echo
+                type = "!i (ir-echo)";
+                snprintf(msg, sizeof(msg), "IR Data Block Received (%d bytes)", (int)len);
+                break;
+        }
+    } 
+    else if (data[0] == 0x49) { // 'I' (Inbound van Node)
+        type = "incoming";
+        // Jouw log: 49 d8 [SEQ] ... [NODE ID]
+        snprintf(msg, sizeof(msg), "Node Data | Seq: %02X | Node: %02X:%02X:%02X", data[2], data[8], data[9], data[10]);
+    }
+    else if (data[0] == 0x69 && data[1] == 0xDC) { // 'id' (Neighbor Dump)
+        type = "nbr-dump";
+        snprintf(msg, sizeof(msg), "Full Neighbor Table Dump (%d bytes)", (int)len);
+    }
+
+    // 2. XML/ASCII Scanner voor TR2 Provisioning (indien aanwezig in data)
+    String readable = "";
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] >= 32 && data[i] <= 126) readable += (char)data[i];
+    }
+    
+    // Als er leesbare XML data in zit, voeg deze toe aan het bericht
+    if (readable.indexOf("gui_xml") != -1) {
+        readable.replace("&#x2F;", "/");
+        snprintf(msg, sizeof(msg), "TR2 REQ: %s", readable.substring(0, 100).c_str());
+    }
+
+    // 3. Fallback naar Hex als msg nog leeg is (voor onbekende records)
+    if (strlen(msg) == 0) {
+        char hexBuf[50] = {0};
+        for(size_t j=0; j<len && j<15; j++) {
             char b[4]; snprintf(b, 4, "%02X ", data[j]); strcat(hexBuf, b);
         }
         snprintf(msg, sizeof(msg), "HEX: %s", hexBuf);
@@ -161,6 +187,7 @@ void processIncomingJennic(const uint8_t* data, size_t len) {
     
     addToLog("jn5168", type, msg);
 }
+
 
 void sendBrainRequest(String path) {
     if (WiFi.status() == WL_CONNECTED && targetIP.toString() != "0.0.0.0") {
@@ -188,58 +215,112 @@ void performPinDiagnostic() {
     uint8_t c0 = 0x00; processAction(&c0, 1, "diag", "/led_off");
 }
 
-void handleIRRequest(AsyncWebServerRequest *request) {
-    uint32_t vals[150];
+ void handleIRRequest(AsyncWebServerRequest *request) {
+    uint16_t vals[150]; // Use uint16_t for 2-byte pulses
     int count = 0;
-    uint16_t freq = 38000;
+    uint16_t freq = 38000; // Default 38kHz
     bool isPost = request->hasParam("s", true);
     if (request->hasParam("s") || isPost) {
         String pulseData = request->getParam("s", isPost)->value();
         pulseData.replace('.', ','); 
-        if (request->hasParam("f", isPost)) freq = (uint16_t)request->getParam("f", isPost)->value().toInt();
+        
+        if (request->hasParam("f", isPost)) {
+            freq = (uint16_t)request->getParam("f", isPost)->value().toInt();
+        }
+
+        // Parse the comma-separated string
         int lastPos = 0, nextPos = 0;
         while ((nextPos = pulseData.indexOf(',', lastPos)) != -1 && count < 150) {
-            vals[count++] = (uint32_t)pulseData.substring(lastPos, nextPos).toInt();
+            vals[count++] = (uint16_t)pulseData.substring(lastPos, nextPos).toInt();
             lastPos = nextPos + 1;
         }
-        vals[count++] = (uint32_t)pulseData.substring(lastPos).toInt();
-        size_t pSize = 5 + (count * 2) + 1;
+        vals[count++] = (uint16_t)pulseData.substring(lastPos).toInt();
+
+        // IR-data conform what we saw in the UART-logs: !I (21 49) + Header + Payload
+        // Header: 12 bytes. Payload: count * 2 bytes. Footer: 1 byte ('E' of extra data)
+        size_t pSize = 12 + (count * 2); 
         uint8_t* irBuf = (uint8_t*)malloc(pSize);
+        
         if(irBuf) {
-            int pIdx = 0;
-            irBuf[pIdx++] = '!'; irBuf[pIdx++] = 'I';
-            irBuf[pIdx++] = (uint8_t)(freq >> 8); irBuf[pIdx++] = (uint8_t)(freq & 0xFF);
-            irBuf[pIdx++] = (uint8_t)count;
+            memset(irBuf, 0, pSize);
+            irBuf[0] = 0x21; irBuf[1] = 0x49; // !I
+            irBuf[4] = (uint8_t)(freq >> 8);   // 0x94 (voor 38000)
+            irBuf[5] = (uint8_t)(freq & 0xFF); // 0x70
+            irBuf[9] = 0x04;                   // Inferred from log (type/flags)
+            irBuf[11] = 0x01;                  // Inferred from log (repeats?)
+
+            int pIdx = 12;
             for (int i = 0; i < count; i++) {
-                irBuf[pIdx++] = (uint8_t)(vals[i] >> 8); irBuf[pIdx++] = (uint8_t)(vals[i] & 0xFF);
+                irBuf[pIdx++] = (uint8_t)(vals[i] >> 8);   // MSB
+                irBuf[pIdx++] = (uint8_t)(vals[i] & 0xFF); // LSB
             }
-            irBuf[pIdx++] = 'E';
+
             processAction(irBuf, pIdx, "web", "/ir_send");
             free(irBuf);
-            request->send(200);
+            request->send(200, "text/plain", "OK");
         }
-    } else { request->send(400); }
+    } else {
+        request->send(400, "text/plain", "Missing pulses 's'");
+    }
+}
+
+void HandleBlinkCommand(AsyncWebServerRequest *request, const char* source,const char* pC) {
+    // command based on UART-log: 21 4d [01 or 00]
+    uint8_t modeVal = 0x00; 
+    if (request->hasParam("mode")) {
+        String m = request->getParam("mode")->value();
+        if (m == "on" || m == "1") modeVal = 0x01; // Conform data:: 21 4d 01
+    }    
+    uint8_t blinkPkg[3] = {0x21, 0x4d, modeVal};
+    processAction(blinkPkg, 3, source, pC);
+    request->send(200, "text/plain", "Blink sent");
+}
+
+void HandleNBRCommand(AsyncWebServerRequest *request, const char* source,const char* pC) {
+    // Request 6lowpan IPV6-table within the JN516x module
+    uint8_t nbrPkg[3] = {0x21, 0x53, 0x00}; 
+    processAction(nbrPkg, 3, source, pC);
+    request->send(200, "text/plain", "NBR Query index 00 sent");
+}
+
+void HandleDiscoCommand(AsyncWebServerRequest *request, const char* source,const char* pC) {
+    // Conform log: 21 5a a0
+    uint8_t discPkg[] = {0x21, 0x5a, 0x0a0}; 
+    processAction(discPkg, 3, source, pC);
+    request->send(200, "text/plain", "Discovery (PJOIN) mode activated");
+}
+
+void HandleEncryptionCommand(AsyncWebServerRequest *request, const char* source,const char* pC) {
+    uint8_t keyPkg[18];
+    keyPkg[0] = 0x21; // '!'
+    keyPkg[1] = 0x4B; // 'K' (Key)
+
+    // Als de key via een parameter 'k' komt (hex string), anders de default uit je log:
+    if (request->hasParam("k")) {
+        String hexKey = request->getParam("k")->value();
+        // Logica om hex-string naar bytes te converteren...
+    } else {
+        // Default NEEO test-key uit jouw log
+        uint8_t defaultKey[] = {0x77, 0x59, 0x7a, 0x6c, 0x91, 0x7c, 0x49, 0x78, 0x97, 0x7b, 0x4b, 0x38, 0x95, 0xb8, 0xfb, 0x80};
+        memcpy(&keyPkg[2], defaultKey, 16);
+    }
+
+    processAction(keyPkg, 18, source, pC);
+    request->send(200, "text/plain", "Airkey pushed to JN5168");
+
 }
 
 void handleUnifiedCommand(AsyncWebServerRequest *request, const char* source) {
     String path = request->url();
     const char* pC = path.c_str();
-    if (path.indexOf("/blink") != -1) {
-        String mode = request->hasParam("mode") ? request->getParam("mode")->value() : "off";
-        uint8_t cmd = (mode == "red") ? 0x11 : (mode == "white") ? 0x21 : 0x00;
-        processAction(&cmd, 1, source, pC);
-        request->send(200);
-    } 
-    else if (path.indexOf("/neighbors") != -1 || path.indexOf("/discovery") != -1) {
-        uint8_t cmd = 0x05;
-        processAction(&cmd, 1, source, pC);
-        request->send(200);
-    }
-    else if (path.indexOf("/encryption") != -1) {
-        uint8_t enc[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05};
-        processAction(enc, sizeof(enc), source, pC);
-        request->send(200);
-    }
+    if (path.indexOf("/blink") != -1) 
+        HandleBlinkCommand(request, source,  pC);
+    else if (path.indexOf("/neighbors") != -1) 
+        HandleNBRCommand(request, source,  pC);
+    else if (path.indexOf("/discovery") != -1) 
+        HandleDiscoCommand(request, source,  pC);
+    else if (path.indexOf("/encryption") != -1) 
+        HandleEncryptionCommand(request, source,  pC);
     else if (path.indexOf("/diag") != -1) { 
         performPinDiagnostic(); 
         request->send(200); 
@@ -282,11 +363,9 @@ void setup() {
 
     auto sharedHandler = [](AsyncWebServerRequest *request) {
         if (request->client()->localPort() == 8080 && targetIP == IPAddress(0,0,0,0)) {
-            targetIP = request->client()->remoteIP();
-            
+            targetIP = request->client()->remoteIP();           
             String msg = "First Bridge Call! TargetIP set to: " + targetIP.toString();
             addToLog("sys", "bridge_init", msg.c_str());
-            Serial.println("[BRIDGE] " + msg);
         }
         const char* source = (request->client()->localPort() == 8080) ? "p_8080" : "p_80";
         handleUnifiedCommand(request, source);
@@ -316,6 +395,7 @@ server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     server.on("/diag", HTTP_ANY, sharedHandler);
     server.on("/ShortPress", HTTP_ANY, sharedHandler);
     server.on("/LongPress", HTTP_ANY, sharedHandler);
+    bridgeServer.on("/sendir", HTTP_ANY, handleIRRequest);
     server.on("/v1/api/ir", HTTP_POST, handleIRRequest);
 
     // Log endpoint for automatic refresh (AJAX)
@@ -382,22 +462,24 @@ void loop() {
     // --- 1. SERIAL PROCESSING (SLIP Protocol) ---
     while (Serial2.available()) {
         uint8_t c = Serial2.read();
-        if (c == 0xC0) { // SLIP Boundary (End of packet)
-            if (sIdx > 0) {
-                processIncomingJennic(sBuf, sIdx);
+
+        if (c == 0xC0) { // End of Frame
+            if (slipRxPtr > 0) {
+                processIncomingJennic(slipRxBuf, slipRxPtr);
+                slipRxPtr = 0; // Reset voor volgend pakket
             }
-            sIdx = 0;
-            escaped = false;
-        } else if (c == 0xDB) { // SLIP Escape character
-            escaped = true;
-        } else {
-            if (escaped) {
-                if (c == 0xDC) c = 0xC0; 
+        } 
+        else if (c == 0xDB) { // Escape start
+            isEscaping = true;
+        } 
+        else {
+            if (isEscaping) {
+                if (c == 0xDC) c = 0xC0;
                 else if (c == 0xDD) c = 0xDB;
-                escaped = false;
+                isEscaping = false;
             }
-            if (sIdx < sizeof(sBuf) - 1) {
-                sBuf[sIdx++] = c;
+            if (slipRxPtr < MAX_SLIP_FRAME) {
+                slipRxBuf[slipRxPtr++] = c;
             }
         }
     }
@@ -416,7 +498,7 @@ void loop() {
         }
     }
 
-    // Listen for response from Python script
+    // Listen for response from Brain
     if (WiFi.status() == WL_CONNECTED) {
         int packetSize = udp.parsePacket();
         if (packetSize) {
@@ -433,7 +515,7 @@ void loop() {
         }
     }
 
-    // --- 3. HTTP ACTIONS (Flag system to prevent Watchdog crashes) ---
+    // Here we execute commands that we need to execute, but need to be done outside handlers (in normal loop, to prevent watchdog crashes)
     if (triggerShortPress) {
         triggerShortPress = false;
         if (targetIP.toString() != "0.0.0.0") {
