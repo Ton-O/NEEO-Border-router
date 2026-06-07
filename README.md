@@ -1,4 +1,10 @@
 # NEEO-Border-router
+
+THIS APPROACH HAS BEEN ABONDONED AND REPLACED BY RUNNING NEEO BRAIN AS CLIENT TO VIRTUAL BRAIN
+(See https://github.com/Ton-O/NEEOBrain-as-client-to-MetaBrain)
+
+
+
 A border router to be used with MetaBrain
 ## *** Alpha status ***
 This software is under development, please do NOT expect a working solution.
