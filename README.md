@@ -1,7 +1,7 @@
 # NEEO-Border-router
 
-THIS APPROACH HAS BEEN ABONDONED AND REPLACED BY RUNNING NEEO BRAIN AS CLIENT TO VIRTUAL BRAIN
-(See https://github.com/Ton-O/NEEOBrain-as-client-to-MetaBrain)
+**THIS APPROACH HAS BEEN ABONDONED AND REPLACED BY RUNNING NEEO BRAIN AS CLIENT TO VIRTUAL BRAIN  
+(See https://github.com/Ton-O/NEEOBrain-as-client-to-MetaBrain)**
 
 
 
