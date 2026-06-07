@@ -88,11 +88,8 @@ uint8_t jennicSeqNum = 0;
 /* --- Neighbor Dump String Cache Sluis --- */
 String nbrDumpText = "";
 
-/* --- Runtime Global Dynamisch MAC Adres --- */
-uint8_t jnMacAddress[8] = {0x00, 0x15, 0x8D, 0x00, 0x00, 0x00, 0x00, 0x00}; // Default basis, overschreven bij boot
 
-/* --- Runtime waiting time for an ACK; variable as we also have Infrared-ack whi h take longer --- */
-int maxAckWaittime;
+
 
 /* --- Core Functions --- */
 
@@ -121,6 +118,14 @@ String getFullLog() {
     }
     return output;
 }
+
+// uint8_t calculateJennicChecksum(const uint8_t* data, size_t len) {
+//     uint8_t crc = 0;
+//     for (size_t i = 0; i < len; i++) {
+//         crc ^= data[i]; 
+//     }
+//     return crc;
+// }
 
 uint8_t calculateJennicChecksum(const uint8_t* data, size_t len) {
     uint8_t crc = 0x00; // Init = 0x00
@@ -161,17 +166,17 @@ uint8_t calculateJennicChecksum(const uint8_t* data, size_t len) {
 
 void escapedWrite(uint8_t data) {
     if (data == 0xC0) {      
-        // Found in trace: C0 is converted to 5C 76
-        Serial2.write(0x5C);
-        Serial2.write(0x76);
-    } else if (data == 0x5C) { 
-        // trace: 5C is converted to 5C 66
-        Serial2.write(0x5C);
-        Serial2.write(0x66);
-    } else {
-        Serial2.write(data);
+            // Found in trace: C0 is converted to 5C 76
+            Serial2.write(0x5C);
+            Serial2.write(0x76);
+        } else if (data == 0x5C) { 
+            // trace: 5C is converted to 5C 66
+            Serial2.write(0x5C);
+            Serial2.write(0x66);
+        } else {
+            Serial2.write(data);
+        }
     }
-}
 
 void sendSlipPacket(const uint8_t* data, size_t len) {
     // NOTE: JN5168 does NOT use a start-byte (0xC0), 
@@ -182,6 +187,20 @@ void sendSlipPacket(const uint8_t* data, size_t len) {
         escapedWrite(data[i]);
     }
     escapedWrite(csum);
+
+        // for (size_t i = 0; i < len; i++) {
+    //     if (data[i] == 0xC0) {      
+    //         // Found in trace: C0 is converted to 5C 76
+    //         Serial2.write(0x5C);
+    //         Serial2.write(0x76);
+    //     } else if (data[i] == 0x5C) { 
+    //         // trace: 5C is converted to 5C 66
+    //         Serial2.write(0x5C);
+    //         Serial2.write(0x66);
+    //     } else {
+    //         Serial2.write(data[i]);
+    //     }
+    // }
     Serial2.write(0xC0); // Send an End-of-Frame marker only
 }
 
@@ -218,10 +237,7 @@ void processIncomingJennic(const uint8_t* data, size_t len) {
         switch(data[1]) {
             case 0x4D: // 'M' - Management/Blink
                 type = "!m (status)";
-                if (len >= 10) {
-                    // Sla het binnengekomen MAC-adres dynamisch op in de globale array
-                    memcpy(jnMacAddress, &data[2], 8);
-                }
+                // In your log: 21 4d 01 (On) or 21 4d 00 (Off/Ready)
                 snprintf(msg, sizeof(msg), "JN interface ID: %02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X",data[2],data[3],data[4],data[5],data[6],data[7],data[8],data[9] );
                 break;
 
@@ -246,44 +262,37 @@ void processIncomingJennic(const uint8_t* data, size_t len) {
                     }
                 }
                 break;
-                
-            case 0x49: // 'I' - Infrared Echo / ACK
-                type = "!i (ir-ack)";
-                
-                // Formatteer de inkomende bytes voor de log (vanaf data[2] om de payload te tonen)
-                {
-                    char hexBytes[32] = {0};
-                    for (size_t j = 2; j < len && j < 8; j++) {
-                        char b[4];
-                        snprintf(b, sizeof(b), "%02X ", data[j]);
-                        strcat(hexBytes, b);
-                    }
-                    snprintf(msg, sizeof(msg), "IR ack received");
-                            snprintf(msg, sizeof(msg), "IR ack received: %02X:%02X:%02X:%02X:%02X:%02X", data[3], data[4], data[5], data[6], data[7], data[8]);
 
-                }
-
-                if (currentTx.awaitingAck && strcmp(currentTx.commandType, "/ir_send") == 0) {
-                        currentTx.awaitingAck = false; // Sluis direct vrijgeven!
-                        unsigned long latency = millis() - currentTx.timestamp;
-                        strcat(msg, " | MATCHED IR-ACK -> Sluis vrijgegeven");
-                }
+            case 0x49: // 'I' - Infrared Echo
+                type = "!i (ir-echo)";
+                snprintf(msg, sizeof(msg), "IR Data Block Received (%d bytes)", (int)len);
                 break;
 
-            case 0x4C: // 'L' - LED ack
-                type = "!L (led-ack)";
+            case 0x4C: // 'L' - LED Echo
+                type = "!L (led-echo)";
                 snprintf(msg, sizeof(msg), "Led acq Received (%d bytes)", (int)len);
                 break;
 
             case 0x5a: // 'Z' - Heartbeat from JN5168 (every 5 seconds)
+            //     type = "!Z (heartbeat)";
                  lastHeartbeat = millis(); // Refresh keep-alive watchdog timer
                  return;                   // return directly so that we do not print the heartbeat records
+            //     snprintf(msg, sizeof(msg), "NBR Heart beat");
                 break;
 
         }
     } 
     else if (data[0] == 0x49) { // 'I' (Inbound from Node)
         type = "incoming pairing";
+        // Your log: 49 d8 e6 cd ab ff ff 64 9e c2 00 00 8d 15 00 05 00 29 00 00 7e 3b 01 f0 0b b8 0c 80 1b 5c 4e 42 52 3f
+        // d8: seq.num 
+        // e6: De Link Quality Indicator (LQI) of RSSI (ontvangststerkte).
+        // cd ab: De PAN ID (0xABCD in reverse byte-order), het unieke ID van het draadloze netwerk.
+        // ff ff: Broadcast of bestemmings-ID.
+        // 64 9e c2 00 00 8d 15 00: Het 64-bit unieke MAC-adres van de Remote Node (00:15:8d:00:00:c2:9e:64 in reverse byte-order, waarbij 00:15:8D de officiële NXP/Jennic IEEE-OUI fabrikantcode is).
+        // 05 00 29 00 00 7e 3b 01 f0 0b b8 0c 80 1b: Protocol-overhead en netwerk-routinginformatie (6LoWPAN / IPv6 UDP-header).
+        // 5c 4e 42 52 3f: De feitelijke data (payload) van de node. In ASCII vertaalt 4E 42 52 3F letterlijk naar: NBR? (Neighbor Request). 
+        // De node vraagt dus actief om zijn buurinformatie! (Merk op dat de 5C hier een letterlijke data-byte is, geen escape-teken).
         snprintf(msg, sizeof(msg), "Node Data (NBR) | Seq: %02X | Node: %02X:%02X:%02X:%02X:%02X:%02X", data[2], data[7], data[8], data[9], data[10], data[11], data[12], data[13], data[14]);
     }
     else if (data[0] == 0x69 && data[1] == 0xDC) { // 'id' (Neighbor Dump)
@@ -294,15 +303,17 @@ void processIncomingJennic(const uint8_t* data, size_t len) {
         nbrDumpText = "";
         
         // Loop through the data to parse potential neighbor nodes (each node record is roughly 14-16 bytes)
+        // We output them as text lines so the Brain's split("\n") logic functions correctly.
         size_t idx = 3; // Skip 69 DC and SeqNum
         while (idx + 10 <= len) {
             char nodeLine[64];
+            // Format a clean text string for this neighbor node containing MAC and short address
             snprintf(nodeLine, sizeof(nodeLine), "id:%02X%02X%02X%02X%02X%02X%02X%02X,short:%02X%02X\n",
                      data[idx], data[idx+1], data[idx+2], data[idx+3],
                      data[idx+4], data[idx+5], data[idx+6], data[idx+7],
                      data[idx+8], data[idx+9]);
             nbrDumpText += nodeLine;
-            idx += 14; 
+            idx += 14; // Advance to next structural record boundary
         }
     }
 
@@ -343,6 +354,7 @@ void sendBrainRequest(String path) {
         addToLog("http", "brain", logMsg);
         http.end();
         
+        // If Brain doesn't respond (e.g. IP changed), reset targetIP to search again
         if (httpCode < 0) targetIP = IPAddress(0,0,0,0);
     }
 }
@@ -357,9 +369,9 @@ void performPinDiagnostic() {
 }
 
  void handleIRRequest(AsyncWebServerRequest *request) {
-    uint16_t vals[150]; 
+    uint16_t vals[150]; // Use uint16_t for 2-byte pulses
     int count = 0;
-    uint16_t freq = 38000; 
+    uint16_t freq = 38000; // Default 38kHz
     bool isPost = request->hasParam("s", true);
     if (request->hasParam("s") || isPost) {
         String pulseData = request->getParam("s", isPost)->value();
@@ -369,6 +381,7 @@ void performPinDiagnostic() {
             freq = (uint16_t)request->getParam("f", isPost)->value().toInt();
         }
 
+        // Parse the comma-separated string
         int lastPos = 0, nextPos = 0;
         while ((nextPos = pulseData.indexOf(',', lastPos)) != -1 && count < 150) {
             vals[count++] = (uint16_t)pulseData.substring(lastPos, nextPos).toInt();
@@ -376,21 +389,23 @@ void performPinDiagnostic() {
         }
         vals[count++] = (uint16_t)pulseData.substring(lastPos).toInt();
 
+        // IR-data conform what we saw in the UART-logs: !I (21 49) + Header + Payload
+        // Header: 12 bytes. Payload: count * 2 bytes. Footer: 1 byte ('E' of extra data)
         size_t pSize = 12 + (count * 2); 
         uint8_t* irBuf = (uint8_t*)malloc(pSize);
         
         if(irBuf) {
             memset(irBuf, 0, pSize);
             irBuf[0] = 0x21; irBuf[1] = 0x49; // !I
-            irBuf[4] = (uint8_t)(freq >> 8);   
-            irBuf[5] = (uint8_t)(freq & 0xFF); 
-            irBuf[9] = 0x04;                   
-            irBuf[11] = 0x01;                  
+            irBuf[4] = (uint8_t)(freq >> 8);   // 0x94 (for 38000)
+            irBuf[5] = (uint8_t)(freq & 0xFF); // 0x70
+            irBuf[9] = 0x04;                   // Inferred from log (type/flags)
+            irBuf[11] = 0x01;                  // Inferred from log (repeats?)
 
             int pIdx = 12;
             for (int i = 0; i < count; i++) {
-                irBuf[pIdx++] = (uint8_t)(vals[i] >> 8);   
-                irBuf[pIdx++] = (uint8_t)(vals[i] & 0xFF); 
+                irBuf[pIdx++] = (uint8_t)(vals[i] >> 8);   // MSB
+                irBuf[pIdx++] = (uint8_t)(vals[i] & 0xFF); // LSB
             }
 
             processAction(irBuf, pIdx, "web", "/ir_send");
@@ -404,8 +419,6 @@ void performPinDiagnostic() {
     }
 }
 
-
-
 void HandleBlinkCommand(AsyncWebServerRequest *request, const char* source, const char* pC) {
     // command based on UART-log: 21 4d [01 or 00]
     uint8_t modeVal = 0x00; 
@@ -418,45 +431,11 @@ void HandleBlinkCommand(AsyncWebServerRequest *request, const char* source, cons
     request->send(200, "text/plain", "Blink sent");
 }
 
-void SendRadioPacket(const char* source, const char* pC) {
-struct record0x2153 {
-    uint8_t nbrPkg[2]      = {0x21, 0x53};  
-    uint8_t seqNum;
-    //uint8_t Serial_Header[13];
-        uint8_t Protocol[6]    = {0x04, 0x09, 0x00, 0x03, 0x0a, 0x00}; 
-        uint8_t Frame_ID;
-        uint8_t Fixed8         = 0x0b;
-        uint8_t Appl_Length[2] = {0x00,0x01};
-        uint8_t Payload_offset = 0x0e;
-        uint8_t Flags[2]       = {0x00,0x01};
-    uint8_t Frame_Control[2];
-    uint8_t Radio_Seq_Number;
-    uint8_t Pan_ID[2] = {0xcd, 0xab};
-    uint8_t Dest_Short[2];
-    uint8_t Dest_Long[8];
-    uint8_t Source[8];
-    char * Appl_Payload;
-};
-record0x2153 currentTx;
-
-    currentTx.seqNum       = jennicSeqNum++;
-    currentTx.Frame_ID     = jennicSeqNum++;
-
-    //01      04 09 00 03 0a 00 29 0b 00 01 0e 00 01             61 dc 29 cd ab 64 9e c2 00 00 8d 15 00 38 9c cd 00 00 8d 15 00 7a 00 00 fd a1 68 4a 36 ca 00 00 02 15 8d 00 00 cd 9c 38 fd a1 68 4a 36 ca 00 00 02 15 8d 00 00 c2 9e 64 11 00 63 04 80 1e 01 00 0c 80 0b b9 00 28 f8 74 ff db dc 0d 1d 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a 2a    uint8_t discPkg[] = {0x21, 0x53, jennicSeqNum++, 0x00, 0x04, 0x09, 0x00, 0x03, 0x0a, 0x00, 0x2a, 0x0b, 0x00, 0x01, 0x0e, 0x00, 0x01, 0x41, 0xd8, 0x2a, 0xcd, 0xab, 0xff, 0xff, 0x38, 0x9c, 0xcd, 0x00, 0x00, 0x8d, 0x15, 0x00, 0x7a, 0x3b, 0x3a, 0x1a, 0x9b, 0x01, 0x47, 0x6f, 0x1e, 0xf0, 0x01, 0x00, 0x10, 0xf0, 0x00, 0x00, 0xfd, 0xa1, 0x68, 0x4a, 0x36, 0xca, 0x00, 0x00, 0x02, 0x15, 0x8d, 0x00, 0x00, 0xcd, 0x9c, 0x38, 0x04, 0x0e, 0x00, 0x17, 0x08, 0x0a, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x3c, 0x08, 0x1e, 0x40, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfd, 0xa1, 0x68, 0x4a, 0x36, 0xca, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-
-    //0xA0}; 
-
-    
-
-}
-
 void HandleNBRCommand(AsyncWebServerRequest *request, const char* source, const char* pC) {
-    uint8_t nbrPkg[2] = {0x3f, 0x51};  // Send message to JN to allow new incoming nodes to join us.
-    processAction(nbrPkg, 2, source, pC);
-    delay(200);
-    uint8_t nbrPkg43[2] = {0x3f, 0x43}; 
-    processAction(nbrPkg43, 2, source, pC);
-
+    // Format from strace: 21 (SOF) 53 (Send) [Seq]
+    uint8_t nbrPkg[3] = {0x21, 0x53, jennicSeqNum++}; 
+    processAction(nbrPkg, 3, source, pC);
+    
     // Return the text-based table rows matching what the Brain string-parser expects
     if (nbrDumpText.length() > 0) {
         request->send(200, "text/plain", nbrDumpText);
@@ -467,6 +446,10 @@ void HandleNBRCommand(AsyncWebServerRequest *request, const char* source, const 
 
 
 void HandleDiscoCommand(AsyncWebServerRequest *request, const char* source, const char* pC) {
+    // Based on trace: 21 5a a0 is the heartbeat of the chip, 
+    // activation via Send (53) + seqnumber + payload.
+    uint8_t discPkg[] = {0x21, 0x53, jennicSeqNum++, 0x00, 0x04, 0x09, 0x00, 0x03, 0x0a, 0x00, 0x2a, 0x0b, 0x00, 0x01, 0x0e, 0x00, 0x01, 0x41, 0xd8, 0x2a, 0xcd, 0xab, 0xff, 0xff, 0x38, 0x9c, 0xcd, 0x00, 0x00, 0x8d, 0x15, 0x00, 0x7a, 0x3b, 0x3a, 0x1a, 0x9b, 0x01, 0x47, 0x6f, 0x1e, 0xf0, 0x01, 0x00, 0x10, 0xf0, 0x00, 0x00, 0xfd, 0xa1, 0x68, 0x4a, 0x36, 0xca, 0x00, 0x00, 0x02, 0x15, 0x8d, 0x00, 0x00, 0xcd, 0x9c, 0x38, 0x04, 0x0e, 0x00, 0x17, 0x08, 0x0a, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x3c, 0x08, 0x1e, 0x40, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfd, 0xa1, 0x68, 0x4a, 0x36, 0xca, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+        //0xA0}; 
     addToLog("8080", "Discovery", "");
 
     uint8_t send_L[] = {0x21, 0x4C, 0x05};  // Blink led?
@@ -728,11 +711,6 @@ void loop() {
             currentTx.timestamp = millis();
             currentTx.awaitingAck = true;
             strncpy(currentTx.commandType, pendingService, sizeof(currentTx.commandType) - 1);
-            if (lockBuf[1] == 0x49)
-                maxAckWaittime = 3000;
-            else
-                maxAckWaittime = 500;
-
             
             if (debugEnabled) {
                 char logEntry[64];
@@ -758,7 +736,7 @@ void loop() {
     }
 
     // --- 3. TRANSACTION TIMEOUT MONITORING WATCHDOG ---
-    if (currentTx.awaitingAck && (millis() - currentTx.timestamp > maxAckWaittime)) {
+    if (currentTx.awaitingAck && (millis() - currentTx.timestamp > 500)) {
         char errEntry[128];
         snprintf(errEntry, sizeof(errEntry), "TIMEOUT waiting for !r ACK on Seq %02X (Service: %s) - Force freeing sluis", currentTx.seqNum, currentTx.commandType);
         addToLog("sys", "error", errEntry);
